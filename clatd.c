@@ -53,8 +53,6 @@
 #include "translate.h"
 #include "tun.h"
 
-#define DEVICEPREFIX "v4-"
-
 /* 40 bytes IPv6 header - 20 bytes IPv4 header + 8 bytes fragment header */
 #define MTU_DELTA 28
 
@@ -112,13 +110,11 @@ int configure_packet_socket(int sock) {
   return 1;
 }
 
-/* function: configure_tun_ip
- * configures the ipv4 and ipv6 addresses on the tunnel interface
- *   tunnel - tun device data
+/* function: ipv4_address_generate
+ * picks a free IPv4 address from the local subnet or exits if there are no free addresses
+ *   returns: the IPv4 address as an in_addr_t
  */
-void configure_tun_ip(const struct tun_data *tunnel) {
-  int status;
-
+static in_addr_t ipv4_address_generate() {
   // Pick an IPv4 address to use by finding a free address in the configured prefix. Technically,
   // there is a race here - if another clatd calls config_select_ipv4_address after we do, but
   // before we call add_address, it can end up having the same IP address as we do. But the time
@@ -133,22 +129,49 @@ void configure_tun_ip(const struct tun_data *tunnel) {
            Global_Clatd_Config.ipv4_local_prefixlen);
     exit(1);
   }
-  Global_Clatd_Config.ipv4_local_subnet.s_addr = localaddr;
+  return localaddr;
+}
 
-  // Configure the interface before bringing it up. As soon as we bring the interface up, the
-  // framework will be notified and will assume the interface's configuration has been finalized.
-  status = add_address(tunnel->device4, AF_INET, &Global_Clatd_Config.ipv4_local_subnet, 32,
-                       &Global_Clatd_Config.ipv4_local_subnet);
-  if (status < 0) {
-    logmsg(ANDROID_LOG_FATAL, "configure_tun_ip/if_address(4) failed: %s", strerror(-status));
+/* function: ipv4_address_from_cmdline
+ * configures the IPv4 address specified on the command line, or exits if the address is not valid
+ *   v4_addr - a string, the IPv4 address
+ *   returns: the IPv4 address as an in_addr_t
+ */
+static in_addr_t ipv4_address_from_cmdline(const char *v4_addr) {
+  in_addr_t localaddr;
+  if (!inet_pton(AF_INET, v4_addr, &localaddr)) {
+    logmsg(ANDROID_LOG_FATAL, "Invalid IPv4 address %s", v4_addr);
     exit(1);
+  }
+  return localaddr;
+}
+
+/* function: configure_tun_ip
+ * configures the ipv4 and ipv6 addresses on the tunnel interface
+ *   tunnel - tun device data
+ */
+void configure_tun_ip(const struct tun_data *tunnel, const char *v4_addr) {
+  if (v4_addr) {
+    Global_Clatd_Config.ipv4_local_subnet.s_addr = ipv4_address_from_cmdline(v4_addr);
+  } else {
+    Global_Clatd_Config.ipv4_local_subnet.s_addr = ipv4_address_generate();
   }
 
   char addrstr[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &Global_Clatd_Config.ipv4_local_subnet, addrstr, sizeof(addrstr));
   logmsg(ANDROID_LOG_INFO, "Using IPv4 address %s on %s", addrstr, tunnel->device4);
 
-  if ((status = if_up(tunnel->device4, Global_Clatd_Config.ipv4mtu)) < 0) {
+  // Configure the interface before bringing it up. As soon as we bring the interface up, the
+  // framework will be notified and will assume the interface's configuration has been finalized.
+  int status = add_address(tunnel->device4, AF_INET, &Global_Clatd_Config.ipv4_local_subnet, 32,
+                           &Global_Clatd_Config.ipv4_local_subnet);
+  if (status < 0) {
+    logmsg(ANDROID_LOG_FATAL, "configure_tun_ip/if_address(4) failed: %s", strerror(-status));
+    exit(1);
+  }
+
+  status = if_up(tunnel->device4, Global_Clatd_Config.ipv4mtu);
+  if (status < 0) {
     logmsg(ANDROID_LOG_FATAL, "configure_tun_ip/if_up(4) failed: %s", strerror(-status));
     exit(1);
   }
@@ -230,15 +253,36 @@ void open_sockets(struct tun_data *tunnel, uint32_t mark) {
   }
 }
 
-/* function: update_clat_ipv6_address
- * picks the clat IPv6 address and configures packet translation to use it.
- *   tunnel - tun device data
+int ipv6_address_changed(const char *interface) {
+  union anyip *interface_ip;
+
+  interface_ip = getinterface_ip(interface, AF_INET6);
+  if (!interface_ip) {
+    logmsg(ANDROID_LOG_ERROR, "Unable to find an IPv6 address on interface %s", interface);
+    return 1;
+  }
+
+  if (!ipv6_prefix_equal(&interface_ip->ip6, &Global_Clatd_Config.ipv6_local_subnet)) {
+    char oldstr[INET6_ADDRSTRLEN];
+    char newstr[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, oldstr, sizeof(oldstr));
+    inet_ntop(AF_INET6, &interface_ip->ip6, newstr, sizeof(newstr));
+    logmsg(ANDROID_LOG_INFO, "IPv6 prefix on %s changed: %s -> %s", interface, oldstr, newstr);
+    free(interface_ip);
+    return 1;
+  } else {
+    free(interface_ip);
+    return 0;
+  }
+}
+
+/* function: clat_ipv6_address_from_interface
+ * picks the clat IPv6 address based on the interface address
  *   interface - uplink interface name
  *   returns: 1 on success, 0 on failure
  */
-int update_clat_ipv6_address(const struct tun_data *tunnel, const char *interface) {
+static int clat_ipv6_address_from_interface(const char *interface) {
   union anyip *interface_ip;
-  char addrstr[INET6_ADDRSTRLEN];
 
   // TODO: check that the prefix length is /64.
   interface_ip = getinterface_ip(interface, AF_INET6);
@@ -247,38 +291,56 @@ int update_clat_ipv6_address(const struct tun_data *tunnel, const char *interfac
     return 0;
   }
 
-  // If our prefix hasn't changed, do nothing. (If this is the first time we configure an IPv6
-  // address, Global_Clatd_Config.ipv6_local_subnet will be ::, which won't match our new prefix.)
-  if (ipv6_prefix_equal(&interface_ip->ip6, &Global_Clatd_Config.ipv6_local_subnet)) {
-    free(interface_ip);
-    return 1;
-  }
-
   // Generate an interface ID.
   config_generate_local_ipv6_subnet(&interface_ip->ip6);
-  inet_ntop(AF_INET6, &interface_ip->ip6, addrstr, sizeof(addrstr));
 
-  if (IN6_IS_ADDR_UNSPECIFIED(&Global_Clatd_Config.ipv6_local_subnet)) {
-    // Startup.
-    logmsg(ANDROID_LOG_INFO, "Using IPv6 address %s on %s", addrstr, interface);
-  } else {
-    // Prefix change.
-    char from_addr[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, from_addr, sizeof(from_addr));
-    logmsg(ANDROID_LOG_INFO, "clat IPv6 address changed from %s to %s", from_addr, addrstr);
-    del_anycast_address(tunnel->write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
+  Global_Clatd_Config.ipv6_local_subnet = interface_ip->ip6;
+  free(interface_ip);
+  return 1;
+}
+
+/* function: clat_ipv6_address_from_cmdline
+ * parses the clat IPv6 address from the command line
+ *   v4_addr - a string, the IPv6 address
+ *   returns: 1 on success, 0 on failure
+ */
+static int clat_ipv6_address_from_cmdline(const char *v6_addr) {
+  if (!inet_pton(AF_INET6, v6_addr, &Global_Clatd_Config.ipv6_local_subnet)) {
+    logmsg(ANDROID_LOG_FATAL, "Invalid source address %s", v6_addr);
+    return 0;
   }
 
+  return 1;
+}
+
+/* function: configure_clat_ipv6_address
+ * picks the clat IPv6 address and configures packet translation to use it.
+ *   tunnel - tun device data
+ *   interface - uplink interface name
+ *   returns: 1 on success, 0 on failure
+ */
+int configure_clat_ipv6_address(const struct tun_data *tunnel, const char *interface,
+                                const char *v6_addr) {
+  int ret;
+  if (v6_addr) {
+    ret = clat_ipv6_address_from_cmdline(v6_addr);
+  } else {
+    ret = clat_ipv6_address_from_interface(interface);
+  }
+  if (!ret) return 0;
+
+  char addrstr[INET6_ADDRSTRLEN];
+  inet_ntop(AF_INET6, &Global_Clatd_Config.ipv6_local_subnet, addrstr, sizeof(addrstr));
+  logmsg(ANDROID_LOG_INFO, "Using IPv6 address %s on %s", addrstr, interface);
+
   // Start translating packets to the new prefix.
-  Global_Clatd_Config.ipv6_local_subnet = interface_ip->ip6;
   add_anycast_address(tunnel->write_fd6, &Global_Clatd_Config.ipv6_local_subnet, interface);
-  free(interface_ip);
 
   // Update our packet socket filter to reflect the new 464xlat IP address.
   if (!configure_packet_socket(tunnel->read_fd6)) {
     // Things aren't going to work. Bail out and hope we have better luck next time.
     // We don't log an error here because configure_packet_socket has already done so.
-    exit(1);
+    return 0;
   }
 
   return 1;
@@ -291,8 +353,8 @@ int update_clat_ipv6_address(const struct tun_data *tunnel, const char *interfac
  *   tunnel           - tun device data
  *   net_id           - NetID to use, NETID_UNSET indicates use of default network
  */
-void configure_interface(const char *uplink_interface, const char *plat_prefix,
-                         struct tun_data *tunnel, unsigned net_id) {
+void configure_interface(const char *uplink_interface, const char *plat_prefix, const char *v4_addr,
+                         const char *v6_addr, struct tun_data *tunnel, unsigned net_id) {
   int error;
 
   if (!read_config("/system/etc/clatd.conf", uplink_interface, plat_prefix, net_id)) {
@@ -331,7 +393,11 @@ void configure_interface(const char *uplink_interface, const char *plat_prefix,
     exit(1);
   }
 
-  configure_tun_ip(tunnel);
+  configure_tun_ip(tunnel, v4_addr);
+
+  if (!configure_clat_ipv6_address(tunnel, uplink_interface, v6_addr)) {
+    exit(1);
+  }
 }
 
 /* function: read_packet
@@ -420,21 +486,11 @@ void event_loop(struct tun_data *tunnel) {
 
     time_t now = time(NULL);
     if (last_interface_poll < (now - INTERFACE_POLL_FREQUENCY)) {
-      update_clat_ipv6_address(tunnel, Global_Clatd_Config.default_pdp_interface);
-      last_interface_poll = now;
+      if (ipv6_address_changed(Global_Clatd_Config.default_pdp_interface)) {
+        break;
+      }
     }
   }
-}
-
-/* function: print_help
- * in case the user is running this on the command line
- */
-void print_help() {
-  printf("android-clat arguments:\n");
-  printf("-i [uplink interface]\n");
-  printf("-p [plat prefix]\n");
-  printf("-n [NetId]\n");
-  printf("-m [socket mark]\n");
 }
 
 /* function: parse_unsigned
@@ -446,101 +502,4 @@ int parse_unsigned(const char *str, unsigned *out) {
   char *end_ptr;
   *out = strtoul(str, &end_ptr, 0);
   return *str && !*end_ptr;
-}
-
-/* function: main
- * allocate and setup the tun device, then run the event loop
- */
-int main(int argc, char **argv) {
-  struct tun_data tunnel;
-  int opt;
-  char *uplink_interface = NULL, *plat_prefix = NULL, *net_id_str = NULL, *mark_str = NULL;
-  unsigned net_id = NETID_UNSET;
-  uint32_t mark   = MARK_UNSET;
-  unsigned len;
-
-  while ((opt = getopt(argc, argv, "i:p:n:m:h")) != -1) {
-    switch (opt) {
-      case 'i':
-        uplink_interface = optarg;
-        break;
-      case 'p':
-        plat_prefix = optarg;
-        break;
-      case 'n':
-        net_id_str = optarg;
-        break;
-      case 'm':
-        mark_str = optarg;
-        break;
-      case 'h':
-        print_help();
-        exit(0);
-      default:
-        logmsg(ANDROID_LOG_FATAL, "Unknown option -%c. Exiting.", (char)optopt);
-        exit(1);
-    }
-  }
-
-  if (uplink_interface == NULL) {
-    logmsg(ANDROID_LOG_FATAL, "clatd called without an interface");
-    exit(1);
-  }
-
-  if (net_id_str != NULL && !parse_unsigned(net_id_str, &net_id)) {
-    logmsg(ANDROID_LOG_FATAL, "invalid NetID %s", net_id_str);
-    exit(1);
-  }
-
-  if (mark_str != NULL && !parse_unsigned(mark_str, &mark)) {
-    logmsg(ANDROID_LOG_FATAL, "invalid mark %s", mark_str);
-    exit(1);
-  }
-
-  len = snprintf(tunnel.device4, sizeof(tunnel.device4), "%s%s", DEVICEPREFIX, uplink_interface);
-  if (len >= sizeof(tunnel.device4)) {
-    logmsg(ANDROID_LOG_FATAL, "interface name too long '%s'", tunnel.device4);
-    exit(1);
-  }
-
-  logmsg(ANDROID_LOG_INFO, "Starting clat version %s on %s netid=%s mark=%s", CLATD_VERSION,
-         uplink_interface, net_id_str ? net_id_str : "(none)", mark_str ? mark_str : "(none)");
-
-  // run under a regular user but keep needed capabilities
-  drop_root_but_keep_caps();
-
-  // open our raw sockets before dropping privs
-  open_sockets(&tunnel, mark);
-
-  // keeps only admin capability
-  set_capability(1 << CAP_NET_ADMIN);
-
-  // we can create tun devices as non-root because we're in the VPN group.
-  tunnel.fd4 = tun_open();
-  if (tunnel.fd4 < 0) {
-    logmsg(ANDROID_LOG_FATAL, "tun_open4 failed: %s", strerror(errno));
-    exit(1);
-  }
-
-  // When run from netd, the environment variable ANDROID_DNS_MODE is set to
-  // "local", but that only works for the netd process itself. Removing the
-  // following line causes XLAT failure in permissive mode.
-  unsetenv("ANDROID_DNS_MODE");
-
-  configure_interface(uplink_interface, plat_prefix, &tunnel, net_id);
-
-  update_clat_ipv6_address(&tunnel, uplink_interface);
-
-  // Loop until someone sends us a signal or brings down the tun interface.
-  if (signal(SIGTERM, stop_loop) == SIG_ERR) {
-    logmsg(ANDROID_LOG_FATAL, "sigterm handler failed: %s", strerror(errno));
-    exit(1);
-  }
-
-  event_loop(&tunnel);
-
-  logmsg(ANDROID_LOG_INFO, "Shutting down clat on %s", uplink_interface);
-  del_anycast_address(tunnel.write_fd6, &Global_Clatd_Config.ipv6_local_subnet);
-
-  return 0;
 }

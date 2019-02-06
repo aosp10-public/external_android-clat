@@ -25,15 +25,22 @@
 
 #include <gtest/gtest.h>
 
+#include "netutils/ifc.h"
+#include "tun_interface.h"
+
 extern "C" {
 #include "checksum.h"
 #include "clatd.h"
 #include "config.h"
+#include "getaddr.h"
 #include "translate.h"
+#include "tun.h"
 }
 
 // For convenience.
 #define ARRAYSIZE(x) sizeof((x)) / sizeof((x)[0])
+
+using android::net::TunInterface;
 
 // Default translation parameters.
 static const char kIPv4LocalAddr[]  = "192.0.0.4";
@@ -287,8 +294,8 @@ void check_packet(const uint8_t *packet, size_t len, const char *msg) {
 
 void reassemble_packet(const uint8_t **fragments, const size_t lengths[], int numpackets,
                        uint8_t *reassembled, size_t *reassembled_len, const char *msg) {
-  struct iphdr *ip    = NULL;
-  struct ip6_hdr *ip6 = NULL;
+  struct iphdr *ip    = nullptr;
+  struct ip6_hdr *ip6 = nullptr;
   size_t total_length, pos = 0;
   uint8_t protocol = 0;
   uint8_t version  = ip_version(fragments[0]);
@@ -560,18 +567,44 @@ int get_transport_checksum(const uint8_t *packet) {
   }
 }
 
+static tun_data makeTunData() {
+  // Create some fake but realistic-looking sockets so update_clat_ipv6_address doesn't balk.
+  return {
+    .write_fd6 = socket(AF_INET6, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_RAW),
+    .read_fd6  = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)),
+    .fd4       = socket(AF_UNIX, SOCK_DGRAM, 0),
+  };
+}
+
+void freeTunData(tun_data *tunnel) {
+  close(tunnel->write_fd6);
+  close(tunnel->read_fd6);
+  close(tunnel->fd4);
+}
+
 struct clat_config Global_Clatd_Config;
 
 class ClatdTest : public ::testing::Test {
  protected:
+  static TunInterface sTun;
+
   virtual void SetUp() {
     inet_pton(AF_INET, kIPv4LocalAddr, &Global_Clatd_Config.ipv4_local_subnet);
     inet_pton(AF_INET6, kIPv6PlatSubnet, &Global_Clatd_Config.plat_subnet);
-    inet_pton(AF_INET6, kIPv6LocalAddr, &Global_Clatd_Config.ipv6_local_subnet);
+    memset(&Global_Clatd_Config.ipv6_local_subnet, 0, sizeof(in6_addr));
     Global_Clatd_Config.ipv6_host_id    = in6addr_any;
     Global_Clatd_Config.use_dynamic_iid = 1;
+    Global_Clatd_Config.default_pdp_interface = const_cast<char *>(sTun.name().c_str());
   }
+
+  // Static because setting up the tun interface takes about 40ms.
+  static void SetUpTestCase() { ASSERT_EQ(0, sTun.init()); }
+
+  // Closing the socket removes the interface and IP addresses.
+  static void TearDownTestCase() { sTun.destroy(); }
 };
+
+TunInterface ClatdTest::sTun;
 
 void expect_ipv6_addr_equal(struct in6_addr *expected, struct in6_addr *actual) {
   if (!IN6_ARE_ADDR_EQUAL(expected, actual)) {
@@ -746,6 +779,55 @@ TEST_F(ClatdTest, SelectIPv4Address) {
   EXPECT_EQ(inet_addr("127.0.0.2"), config_select_ipv4_address(&addr, 29));
 }
 
+TEST_F(ClatdTest, ConfigureTunIp) {
+  addr_free_func orig_config_is_ipv4_address_free = config_is_ipv4_address_free;
+  config_is_ipv4_address_free                     = over6_free;
+
+  Global_Clatd_Config.ipv4_local_prefixlen = 29;
+  Global_Clatd_Config.ipv4mtu              = 1472;
+
+  // Create an interface for configure_tun_ip to configure and bring up.
+  TunInterface v4Iface;
+  ASSERT_EQ(0, v4Iface.init());
+  struct tun_data tunnel = makeTunData();
+  strlcpy(tunnel.device4, v4Iface.name().c_str(), sizeof(tunnel.device4));
+
+  configure_tun_ip(&tunnel, nullptr /* v4_addr */);
+  EXPECT_EQ(inet_addr("192.0.0.6"), Global_Clatd_Config.ipv4_local_subnet.s_addr);
+
+  union anyip *ip = getinterface_ip(v4Iface.name().c_str(), AF_INET);
+  EXPECT_EQ(inet_addr("192.0.0.6"), ip->ip4.s_addr);
+  free(ip);
+
+  config_is_ipv4_address_free = orig_config_is_ipv4_address_free;
+  v4Iface.destroy();
+}
+
+TEST_F(ClatdTest, ConfigureTunIpManual) {
+  addr_free_func orig_config_is_ipv4_address_free = config_is_ipv4_address_free;
+  config_is_ipv4_address_free                     = over6_free;
+
+  Global_Clatd_Config.ipv4_local_prefixlen = 29;
+  Global_Clatd_Config.ipv4mtu              = 1472;
+
+  // Create an interface for configure_tun_ip to configure and bring up.
+  TunInterface v4Iface;
+  ASSERT_EQ(0, v4Iface.init());
+  struct tun_data tunnel = makeTunData();
+  strlcpy(tunnel.device4, v4Iface.name().c_str(), sizeof(tunnel.device4));
+
+  configure_tun_ip(&tunnel, "192.0.2.1" /* v4_addr */);
+  EXPECT_EQ(inet_addr("192.0.2.1"), Global_Clatd_Config.ipv4_local_subnet.s_addr);
+
+  union anyip *ip = getinterface_ip(v4Iface.name().c_str(), AF_INET);
+  ASSERT_NE(nullptr, ip);
+  EXPECT_EQ(inet_addr("192.0.2.1"), ip->ip4.s_addr);
+  free(ip);
+
+  config_is_ipv4_address_free = orig_config_is_ipv4_address_free;
+  v4Iface.destroy();
+}
+
 TEST_F(ClatdTest, DataSanitycheck) {
   // Sanity checks the data.
   uint8_t v4_header[] = { IPV4_UDP_HEADER };
@@ -877,6 +959,9 @@ TEST_F(ClatdTest, AdjustChecksum) {
 }
 
 TEST_F(ClatdTest, Translate) {
+  // This test uses hardcoded packets so the clatd address must be fixed.
+  inet_pton(AF_INET6, kIPv6LocalAddr, &Global_Clatd_Config.ipv6_local_subnet);
+
   uint8_t udp_ipv4[] = { IPV4_UDP_HEADER UDP_HEADER PAYLOAD };
   uint8_t udp_ipv6[] = { IPV6_UDP_HEADER UDP_HEADER PAYLOAD };
   fix_udp_checksum(udp_ipv4);
@@ -895,6 +980,9 @@ TEST_F(ClatdTest, Translate) {
 }
 
 TEST_F(ClatdTest, Fragmentation) {
+  // This test uses hardcoded packets so the clatd address must be fixed.
+  inet_pton(AF_INET6, kIPv6LocalAddr, &Global_Clatd_Config.ipv6_local_subnet);
+
   check_fragment_translation(kIPv4Fragments, kIPv4FragLengths, kIPv6Fragments, kIPv6FragLengths,
                              ARRAYSIZE(kIPv4Fragments), "IPv4->IPv6 fragment translation");
 
@@ -925,7 +1013,7 @@ TEST_F(ClatdTest, TranslateChecksumNeutral) {
   ASSERT_TRUE(inet_pton(AF_INET6, "2001:db8:1:2:f076:ae99:124e:aa54",
                         &Global_Clatd_Config.ipv6_local_subnet));
   config_generate_local_ipv6_subnet(&Global_Clatd_Config.ipv6_local_subnet);
-  ASSERT_NE((uint32_t)0x00000464, Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
+  ASSERT_NE(htonl((uint32_t)0x00000464), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
   ASSERT_NE((uint32_t)0, Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
 
   // Check that translating UDP packets is checksum-neutral. First, IPv4.
@@ -942,4 +1030,99 @@ TEST_F(ClatdTest, TranslateChecksumNeutral) {
   fix_udp_checksum(udp_ipv6);
   check_translate_checksum_neutral(udp_ipv4, sizeof(udp_ipv4), sizeof(udp_ipv4) + 20,
                                    "UDP/IPv4 -> UDP/IPv6 checksum neutral");
+}
+
+TEST_F(ClatdTest, GetInterfaceIp) {
+  union anyip *ip = getinterface_ip(sTun.name().c_str(), AF_INET6);
+  ASSERT_NE(nullptr, ip);
+  in6_addr expected = sTun.srcAddr();
+  in6_addr actual   = ip->ip6;
+  expect_ipv6_addr_equal(&expected, &actual);
+}
+
+void expectSocketBound(int ifindex, int sock) {
+  // Check that the packet socket is bound to the interface. We can't check the socket filter
+  // because there is no way to fetch it from the kernel.
+  sockaddr_ll sll;
+  socklen_t len = sizeof(sll);
+  ASSERT_EQ(0, getsockname(sock, reinterpret_cast<sockaddr *>(&sll), &len));
+  EXPECT_EQ(htons(ETH_P_IPV6), sll.sll_protocol);
+  EXPECT_EQ(ifindex, sll.sll_ifindex);
+}
+
+TEST_F(ClatdTest, ConfigureIpv6Address) {
+  struct tun_data tunnel = makeTunData();
+
+  // Run configure_clat_ipv6_address.
+  ASSERT_TRUE(IN6_IS_ADDR_UNSPECIFIED(&Global_Clatd_Config.ipv6_local_subnet));
+  ASSERT_EQ(1, configure_clat_ipv6_address(&tunnel, sTun.name().c_str(), nullptr /* v6_addr */));
+
+  // Check that it generated an IID in the same prefix as the address assigned to the interface,
+  // and that the IID is not the default IID.
+  in6_addr addr = sTun.srcAddr();
+  EXPECT_TRUE(ipv6_prefix_equal(&Global_Clatd_Config.ipv6_local_subnet, &addr));
+  EXPECT_FALSE(IN6_ARE_ADDR_EQUAL(&Global_Clatd_Config.ipv6_local_subnet, &addr));
+  EXPECT_NE(htonl((uint32_t)0x00000464), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
+  EXPECT_NE((uint32_t)0, Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
+
+  expectSocketBound(sTun.ifindex(), tunnel.read_fd6);
+
+  freeTunData(&tunnel);
+}
+
+TEST_F(ClatdTest, ConfigureIpv6AddressCommandLine) {
+  struct tun_data tunnel = makeTunData();
+
+  ASSERT_TRUE(IN6_IS_ADDR_UNSPECIFIED(&Global_Clatd_Config.ipv6_local_subnet));
+
+  const char *addrStr = "2001:db8::f00";
+  in6_addr addr;
+  ASSERT_EQ(1, inet_pton(AF_INET6, addrStr, &addr));
+  ASSERT_EQ(1, configure_clat_ipv6_address(&tunnel, sTun.name().c_str(), addrStr));
+
+  EXPECT_EQ(htonl(0x20010db8), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[0]);
+  EXPECT_EQ(htonl(0x00000000), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[1]);
+  EXPECT_EQ(htonl(0x00000000), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[2]);
+  EXPECT_EQ(htonl(0x00000f00), Global_Clatd_Config.ipv6_local_subnet.s6_addr32[3]);
+
+  // Check that the packet socket is bound to the interface. We can't check the socket filter
+  // because there is no way to fetch it from the kernel.
+  sockaddr_ll sll;
+  socklen_t len = sizeof(sll);
+  ASSERT_EQ(0, getsockname(tunnel.read_fd6, reinterpret_cast<sockaddr *>(&sll), &len));
+  EXPECT_EQ(htons(ETH_P_IPV6), sll.sll_protocol);
+  EXPECT_EQ(sll.sll_ifindex, sTun.ifindex());
+
+  expectSocketBound(sTun.ifindex(), tunnel.read_fd6);
+
+  freeTunData(&tunnel);
+}
+
+TEST_F(ClatdTest, Ipv6AddressChanged) {
+  // Configure the clat IPv6 address.
+  struct tun_data tunnel = {
+    .write_fd6 = socket(AF_INET6, SOCK_RAW | SOCK_NONBLOCK, IPPROTO_RAW),
+    .read_fd6  = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6)),
+  };
+  const char *ifname = sTun.name().c_str();
+  ASSERT_EQ(1, configure_clat_ipv6_address(&tunnel, ifname, nullptr));
+  EXPECT_EQ(0, ipv6_address_changed(ifname));
+  EXPECT_EQ(0, ipv6_address_changed(ifname));
+
+  // Change the IP address on the tun interface to a new prefix.
+  char srcaddr[INET6_ADDRSTRLEN];
+  char dstaddr[INET6_ADDRSTRLEN];
+  ASSERT_NE(nullptr, inet_ntop(AF_INET6, &sTun.srcAddr(), srcaddr, sizeof(srcaddr)));
+  ASSERT_NE(nullptr, inet_ntop(AF_INET6, &sTun.dstAddr(), dstaddr, sizeof(dstaddr)));
+  EXPECT_EQ(0, ifc_del_address(ifname, srcaddr, 64));
+  EXPECT_EQ(0, ifc_del_address(ifname, dstaddr, 64));
+
+  // Check that we can tell that the address has changed.
+  EXPECT_EQ(0, ifc_add_address(ifname, "2001:db8::1:2", 64));
+  EXPECT_EQ(1, ipv6_address_changed(ifname));
+  EXPECT_EQ(1, ipv6_address_changed(ifname));
+
+  // Restore the tun interface configuration.
+  sTun.destroy();
+  ASSERT_EQ(0, sTun.init());
 }
